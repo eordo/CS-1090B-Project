@@ -1,0 +1,3 @@
+[submodule "src/ncde_now"]
+	path = src/ncde_now
+	url = https://github.com/sklim84/NCDENow_CIKM2024.git
