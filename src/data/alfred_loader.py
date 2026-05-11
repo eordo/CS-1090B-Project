@@ -47,6 +47,32 @@ from pathlib import Path
 from .series_catalog import CORE_SERIES
 
 
+# ALFRED does not carry the following series as archivable monthly vintages 
+# because:
+#
+#   1. They are computed/derived series that are calculated on the fly, or;
+#   2. They are sub-monthly frequency series.
+#
+# The treatment is to skip ALFRED entirely for these series and fill them from 
+# the clean FRED-MD panel. All fallback series are revision-free, so this is 
+# methodologically correct because the "real-time" value equals the current 
+# published value.
+ALFRED_FALLBACK_IDS = {
+    # Computed spreads: no ALFRED vintage.
+    'T10YFFM',          # 10Y Treasury - Fed Funds
+    'BAAFFM',           # Baa - Fed Funds
+    # Daily series: monthly frequency query returns nothing useful.
+    'VIXCLS',           # VIX (catalog name: VXOCLSx)
+    'MCOILWTICO',       # WTI Oil (catalog name: OILPRICEx)
+    'EXCAUS',           # CAD/USD FX (catalog name: EXCAUSx)
+    # Weekly series: same problem as daily series.
+    'ICSA',             # Initial jobless claims (catalog name: CLAIMSx)
+    # Monthly series: incomplete/absent ALFRED coverage.
+    'CUMFNS',           # Capacity utilization: manufacturing
+    'CMRMTSPL',         # Real Mfg & Trade Sales (catalog name: CMRMTSPLx)
+    'DPCERA3M086SBEA',  # Real PCE (limited early ALFRED history)
+}
+
 ALFRED_BASE_URL  = 'https://api.stlouisfed.org/fred'
 REQUEST_TIMEOUT  = 20   # Seconds per API call
 RETRY_ATTEMPTS   = 3    # Retries on transient HTTP errors
@@ -188,6 +214,7 @@ def build_ragged_edge_dataset(
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
     data_dir: str | Path = None,
     api_key: str = None,
+    fredmd_clean: pd.DataFrame = None,
     sample_start: str = '2000-01-01',
     sample_end: str = '2024-12-01',
     verbose: bool = True,
@@ -216,10 +243,21 @@ def build_ragged_edge_dataset(
     n_series     = len(series_names)
     n_dates      = len(nowcast_dates)
 
+    # Identify which series need ALFRED vs. a clean-panel fallback.
+    fallback_names = {
+        name for name, (fred_id, _, _) in core_series.items()
+        if fred_id in ALFRED_FALLBACK_IDS
+    }
+    alfred_names = [n for n in series_names if n not in fallback_names]
+
     # Pre-fetch all vintage date lists to avoid redundant API calls. Each 
     # series needs its vintage list looked up once.
     if verbose:
-        print(f"Pre-fetching vintage date lists for {n_series} series...")
+        print("Series breakdown:")
+        print(f"  ALFRED vintage fetch: {len(alfred_names)} series")
+        print(f"  Clean-panel fallback: {len(fallback_names)} series "
+              f"({sorted(fallback_names)})")
+        print(f"Pre-fetching vintage date lists for {len(alfred_names)} series...")
 
     vintage_map = {}
     for name, (fred_id, _, desc) in core_series.items():
@@ -250,17 +288,40 @@ def build_ragged_edge_dataset(
 
     for t_idx, t_now in enumerate(nowcast_dates):
         # Observation window is length `lookback_months`, ending at `t_now`.
-        obs_end   = t_now
-        obs_start = t_now - pd.DateOffset(months=lookback_months - 1)
-        obs_start = obs_start.replace(day=1) # First of the month
-        obs_end_str   = obs_end.strftime('%Y-%m-%d')
-        obs_start_str = obs_start.strftime('%Y-%m-%d')
+        obs_ref_end   = (t_now - pd.DateOffset(months=1)).replace(day=1)
+        obs_ref_start = (obs_ref_end - pd.DateOffset(months=lookback_months-1))
+        obs_ref_start = obs_ref_start.replace(day=1)
 
-        n_available = 0
-        n_missing   = 0
+        obs_end_str   = t_now.strftime('%Y-%m-%d')
+        obs_start_str = obs_ref_start.strftime('%Y-%m-%d')
+
+        # Align to the expected monthly date index. Build a reference 
+        # index of month-start dates for the window.
+        ref_index = pd.date_range(
+            start=obs_ref_start,
+            end=obs_ref_end,
+            freq='MS'
+        )
+        
+        if len(ref_index) > lookback_months:
+            ref_index = ref_index[-lookback_months:]
+
+        n_alfred   = 0
+        n_fallback = 0
+        n_missing  = 0
         for s_idx, name in enumerate(series_names):
             fred_id = core_series[name][0]
-            vintage_dates = vintage_map[name]
+            if name in fallback_names:
+                if fredmd_clean is not None and name in fredmd_clean.columns:
+                    col_vals = fredmd_clean[name].reindex(ref_index)
+                    snapshots[t_idx,:len(ref_index),s_idx] = (
+                        col_vals.values[:lookback_months]
+                    )
+                    n_fallback += 1
+                else:
+                    n_missing += 1
+                continue
+            vintage_dates = vintage_map.get(name, [])
             if not vintage_dates:
                 n_missing += 1
                 continue
@@ -287,12 +348,6 @@ def build_ragged_edge_dataset(
                 n_missing += 1
                 continue
 
-            # Align to the expected monthly date index. Build a reference 
-            # index of month-start dates for the window.
-            ref_index = pd.date_range(
-                start=obs_start, end=obs_end, freq='MS'
-            )[:lookback_months]
-
             df_obs = df_obs.set_index('date').reindex(ref_index)
             values = df_obs['value'].values
 
@@ -300,13 +355,12 @@ def build_ragged_edge_dataset(
             # length `lookback_months`.
             n_vals = min(len(values), lookback_months)
             snapshots[t_idx,:n_vals,s_idx] = values[:n_vals]
-            n_available += 1
+            n_alfred += 1
 
         if verbose:
-            print(
-                f"  {t_now.strftime('%Y-%m-%d')}   "
-                f"{n_available:>10}  {n_missing:>20}"
-            )
+            print(f"  {t_now.strftime('%Y-%m-%d')}   "
+                  f"ALFRED={n_alfred:>4}  fallback={n_fallback:>4}  "
+                  f"NaN={n_missing:>4}")
 
     result = {
         'snapshots': snapshots,             # (T, lookback_months, N)
@@ -336,6 +390,7 @@ def load_or_build_ragged_edge(
     core_series: dict = None,
     nowcast_dates: list[pd.Timestamp] = None,
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
+    fredmd_clean: pd.DataFrame = None,
     sample_start: str = '2000-01-01',
     sample_end: str = '2024-12-01',
     force_rebuild: bool = False,
@@ -361,6 +416,8 @@ def load_or_build_ragged_edge(
     if verbose:
         print("Building ragged-edge dataset from ALFRED API...")
         print("  ⚠ This will take 20-40 minutes. Do not interrupt.")
+        if fredmd_clean is None:
+            print("  ⚠ fredmd_clean not provided. Fallback series will be NaN.")
         print("  The result will be cached to avoid repeating this step.\n")
 
     return build_ragged_edge_dataset(
@@ -369,6 +426,7 @@ def load_or_build_ragged_edge(
         lookback_months=lookback_months,
         data_dir=data_dir,
         api_key=api_key,
+        fredmd_clean=fredmd_clean,
         sample_start=sample_start,
         sample_end=sample_end,
         verbose=verbose,
