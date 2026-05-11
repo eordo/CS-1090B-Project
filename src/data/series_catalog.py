@@ -69,8 +69,6 @@ GROUPS = {
 # FRED-QD target series.
 FREDQD_SERIES = {
     # GDPC1 is the sole nowcasting target.
-    # GDPDEF is retained as supplementary context but NOT used as a model input.
     'GDPC1':  ('GDPC1',  5, 'Real GDP Chained 2017$ — PRIMARY NOWCASTING TARGET'),
-    'GDPDEF': ('GDPDEF', 6, 'GDP Deflator Price Index — supplementary context only'),
 }
 GDP_TARGET = 'GDPC1'
