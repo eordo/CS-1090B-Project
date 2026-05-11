@@ -9,7 +9,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 
-N_FACTORS = 4
+N_FACTORS = 6
 ROLLING_WINDOW = 12
 
 
@@ -30,7 +30,7 @@ def impute_ragged_edge(
 
     if df.isna().any().any():
         warnings.warn(
-            "inpute_ragged_edge: residual NaNs after imputation. "
+            "impute_ragged_edge: residual NaNs after imputation. "
             "Check for series that are entirely NaN in this snapshot.",
             UserWarning,
             stacklevel=2
