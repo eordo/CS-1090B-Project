@@ -112,11 +112,11 @@ def load_fredmd(
                 )
             frames[name] = s
             if verbose:
-                print(f"  ✓ {name:<22}  tcode={tcode}  {desc}")
+                print(f"  ✓ {name:<15}  tcode={tcode}  {desc}")
         except Exception as e:
             failed[name] = str(e)
             if verbose:
-                print(f"  ✗ {name:<22}  ERROR: {e}")
+                print(f"  ✗ {name:<15}  ERROR: {e}")
 
     if failed:
         warnings.warn(
@@ -242,6 +242,6 @@ def _summarize(name: str, df: pd.DataFrame) -> None:
         print(f"  {name}: EMPTY — check file path or API key and re-run")
     else:
         print(
-            f"  {name}: shape={df.shape}  "
+            f"  {name}: shape={df.shape}\t"
             f"{df.index.min().date()} -> {df.index.max().date()}"
         )
