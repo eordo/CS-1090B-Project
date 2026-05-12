@@ -68,8 +68,8 @@ class NCDEResult(NamedTuple):
     """
     Return value of expanding_window_ncde().
     """
-    prediction: pd.DataFrame
-    history:    pd.DataFrame
+    predictions: pd.DataFrame
+    history:     pd.DataFrame
 
 
 def align_gdp_to_nowcast_dates(
@@ -117,10 +117,7 @@ def build_ncde_model(
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    _check_torchcde_compat()
     NCDENow = _import_ncde()
-
     return NCDENow(
         fe_type=fe_type,
         cde_type=cde_type,
@@ -363,18 +360,57 @@ def _check_torchcde_compat() -> None:
     Verify that the installed torchcde exposes the private CubicSpline
     attributes that NCDENow's CustomCubicSpline subclass depends on.
     """
-    required = ['_b', '_two_c', '_three_d', '_interpret_t']
-    missing  = [
-        attr for attr in required
-        if not hasattr(torchcde.interpolation_cubic.CubicSpline, attr)
-    ]
-    if missing:
+    has_old_attrs = all(
+        hasattr(torchcde.interpolation_cubic.CubicSpline, a)
+        for a in ('_b', '_two_c', '_three_d')
+    )
+    has_public_deriv = hasattr(
+        torchcde.interpolation_cubic.CubicSpline, 'derivative'
+    )
+    if has_old_attrs:
+        print(f"torchcde {torchcde.__version__}: no patch needed.")
+    elif has_public_deriv:
+        print(f"torchcde {torchcde.__version__}: public derivative() detected, "
+              "patch will be applied on first model import.")
+    else:
         raise RuntimeError(
-            "Installed torchcde is incompatible with NCDENow.\n"
-            f"CubicSpline is missing private attributes: {missing}\n"
-            "NCDENow requires torchcde 0.2.x. Check "
-            "src/ncde_now/environment.yaml for the pinned version."
+            f"torchcde {torchcde.__version__} is not compatible with NCDENow. "
+            "CubicSpline has neither the old private coefficient attributes "
+            "nor a public derivative() method. Install torchcde 0.2.5."
         )
+
+
+def _patch_custom_cubic_spline() -> None:
+    from sub_module.neural_cde import CustomCubicSpline
+ 
+    # Already patched? Nothing to do.
+    if getattr(CustomCubicSpline, '_patched_for_torchcde_025', False):
+        return
+ 
+    # Old torchcde versions have the private attrs. No patch needed.
+    _OLD_ATTRS = ('_b', '_two_c', '_three_d')
+    if all(hasattr(torchcde.interpolation_cubic.CubicSpline, a) for a in _OLD_ATTRS):
+        return
+ 
+    # Confirm the public derivative() exists to replace them.
+    if not hasattr(torchcde.interpolation_cubic.CubicSpline, 'derivative'):
+        raise RuntimeError(
+            f"torchcde {torchcde.__version__} CubicSpline has neither the old "
+            "private coefficient attributes nor a public derivative() method. "
+            "This torchcde version is not supported."
+        )
+ 
+    def _derivative_025(self, t):
+        """
+        Delegate to the torchcde 0.2.5 public derivative() and return as
+        (deriv, deriv) to match the (alpha, beta) hidden state tuple that
+        cdeint expects from the NeuralCDE vector field.
+        """
+        deriv = super(CustomCubicSpline, self).derivative(t)
+        return deriv, deriv
+ 
+    CustomCubicSpline.derivative = _derivative_025
+    CustomCubicSpline._patched_for_torchcde_025 = True
 
 
 def _date_to_quarter_str(dt: pd.Timestamp) -> str:
@@ -386,9 +422,10 @@ def _import_ncde():
     """Lazily import NCDENow. Raises an error if the submodule is absent."""
     try:
         from ncde_now.model import NCDENow
-        return NCDENow
     except ImportError:
         raise ImportError("Cannot import NCDENow from src/ncde_now/model.py.")
+    _patch_custom_cubic_spline()
+    return NCDENow
 
 
 def _prepend_time_channel(panel: np.ndarray) -> np.ndarray:
