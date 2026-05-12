@@ -227,7 +227,9 @@ def expanding_window_ncde(
         model.train()
         n_train = t
         final_loss = np.nan
-        for epoch in tqdm(range(1, epochs + 1), desc='Training', leave=False):
+        # Scale epochs with training set size.
+        effective_epochs = min(epochs, max(50, int(epochs * n_train / 50)))
+        for epoch in tqdm(range(effective_epochs), desc='Training', leave=False):
             perm       = torch.randperm(n_train, device=device)
             epoch_loss = 0.0
             n_batches  = 0
@@ -243,6 +245,8 @@ def expanding_window_ncde(
 
                 optimizer.zero_grad()
                 pred_y, _, _ = model(b_x, b_coeffs, b_f)
+                # Winsorize predictions to prevent losses from blowing up.
+                pred_y = torch.clamp(pred_y, -20.0, 20.0)
                 loss = criterion(pred_y, b_y)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -276,7 +280,7 @@ def expanding_window_ncde(
                 device=device
             )
             pred_y, _, _ = model(x_t, c_snap, f_snap)
-            y_pred = pred_y.item()
+            y_pred = float(torch.clamp(pred_y, -20.0, 20.0).item())
 
         y_true = float(gdp_growth[t])
 
