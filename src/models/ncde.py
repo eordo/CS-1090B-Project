@@ -327,6 +327,228 @@ def expanding_window_ncde(
     return NCDEResult(predictions=predictions, history=history)
 
 
+def fixed_split_ncde(
+    panels: np.ndarray,
+    factors: np.ndarray,
+    gdp_growth: np.ndarray,
+    nowcast_dates: list[pd.Timestamp],
+    train_end_date: pd.Timestamp,
+    n_factors: int           = DEFAULT_N_FACTORS,
+    hidden_size: int         = DEFAULT_HIDDEN_SIZE,
+    hidden_hidden_size: int  = DEFAULT_HIDDEN_HIDDEN_SIZE,
+    n_layers: int            = DEFAULT_N_LAYERS,
+    fe_type: str             = DEFAULT_FE_TYPE,
+    cde_type: str            = DEFAULT_CDE_TYPE,
+    ode_method: str          = DEFAULT_ODE_METHOD,
+    lr: float                = DEFAULT_LR,
+    epochs: int              = DEFAULT_EPOCHS,
+    batch_size: int          = DEFAULT_BATCH_SIZE,
+    grad_clip: float         = DEFAULT_GRAD_CLIP,
+    weight_decay: float      = DEFAULT_WEIGHT_DECAY,
+    checkpoint_dir: Optional[Path] = None,
+    checkpoint_label: str    = 'ncde_fixed',
+    device: Optional[torch.device] = None,
+    verbose: bool            = True,
+) -> NCDEResult:
+    """
+    Fixed train/test split evaluation of NCDENow.
+ 
+    Trains the model once on all quarters up to train_end_date, then
+    predicts all subsequent quarters with the fixed trained model.
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+ 
+    torch.manual_seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+ 
+    T, L, N = panels.shape
+    assert factors.shape == (T, n_factors), (
+        f"factors shape {factors.shape} does not match (T={T}, n_factors={n_factors})"
+    )
+    assert len(gdp_growth) == T
+    assert len(nowcast_dates) == T
+ 
+    train_end_idx = next(
+        (i for i, d in enumerate(nowcast_dates) if d > train_end_date),
+        T,  # If train_end_date >= all dates, then entire sample is training.
+    )
+    n_train = train_end_idx
+    n_test  = T - train_end_idx
+ 
+    if n_train == 0:
+        raise ValueError(
+            f"train_end_date {train_end_date.date()} is before all nowcast dates. "
+            "No training data available."
+        )
+    if n_test == 0:
+        raise ValueError(
+            f"train_end_date {train_end_date.date()} is after all nowcast dates. "
+            "No test data available."
+        )
+ 
+    if verbose:
+        print(
+            f"Fixed split: train=[0, {train_end_idx})  "
+            f"{nowcast_dates[0].date()} -> {nowcast_dates[train_end_idx-1].date()}  "
+            f"({n_train} quarters)"
+        )
+        print(
+            f"             test=[{train_end_idx}, {T})  "
+            f"{nowcast_dates[train_end_idx].date()} -> {nowcast_dates[-1].date()}  "
+            f"({n_test} quarters)"
+        )
+ 
+    # Prepare training data.
+    X_train_np = _prepend_time_channel(panels[:train_end_idx])  # (n_train, L, N+1)
+    F_train_np = factors[:train_end_idx].astype(np.float32)     # (n_train, n_factors)
+    y_train_np = gdp_growth[:train_end_idx].astype(np.float32)  # (n_train,)
+ 
+    # Drop rows where GDP is NaN (tail of sample before release).
+    valid_mask = ~np.isnan(y_train_np)
+    X_train_np = X_train_np[valid_mask]
+    F_train_np = F_train_np[valid_mask]
+    y_train_np = y_train_np[valid_mask]
+    n_valid    = len(y_train_np)
+ 
+    if verbose:
+        print(f"  Valid training quarters (non-NaN GDP): {n_valid}")
+ 
+    path_t = torch.tensor(X_train_np, dtype=torch.float32, device=device)
+    # Pre-compute spline coefficients once.
+    train_coeffs  = torchcde.natural_cubic_spline_coeffs(path_t)
+    train_factors = torch.tensor(F_train_np, dtype=torch.float32, device=device)
+    train_y       = torch.tensor(y_train_np, dtype=torch.float32, device=device).unsqueeze(1)
+ 
+    # Initialize model.
+    model = build_ncde_model(
+        n_series=N,
+        n_factors=n_factors,
+        hidden_size=hidden_size,
+        hidden_hidden_size=hidden_hidden_size,
+        n_layers=n_layers,
+        fe_type=fe_type,
+        cde_type=cde_type,
+        ode_method=ode_method,
+        device=device,
+    )
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay
+    )
+    criterion = nn.MSELoss()
+ 
+    # Training loop.
+    model.train()
+    history_rows = []
+    final_loss   = np.nan 
+    for epoch in tqdm(range(epochs), desc='Training', leave=False):
+        perm       = torch.randperm(n_valid, device=device)
+        epoch_loss = 0.0
+        n_batches  = 0
+        for start in range(0, n_valid, batch_size):
+            idx = perm[start : start + batch_size]
+            if len(idx) == 0:
+                continue
+ 
+            b_x      = path_t[idx]
+            b_coeffs = train_coeffs[idx]
+            b_f      = train_factors[idx]
+            b_y      = train_y[idx]
+ 
+            optimizer.zero_grad()
+            pred_y, _, _ = model(b_x, b_coeffs, b_f)
+            # Winsorize predictions to prevent losses from blowing up.
+            pred_y = torch.clamp(pred_y, -20.0, 20.0)
+            loss   = criterion(pred_y, b_y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+ 
+            epoch_loss += loss.item()
+            n_batches  += 1
+ 
+        avg_loss   = epoch_loss / max(n_batches, 1)
+        final_loss = avg_loss
+ 
+        # Record epoch history.
+        history_rows.append({
+            'step': 0,
+            'nowcast_date': nowcast_dates[train_end_idx - 1],
+            'epoch': epoch + 1,
+            'train_loss': avg_loss
+        })
+        if verbose and (epoch + 1) % 25 == 0:
+            print(f"  epoch {epoch+1:>3}/{epochs}  loss={avg_loss:.5f}")
+ 
+    # Save checkpoint.
+    if checkpoint_dir is not None:
+        ckpt_path = checkpoint_dir / f"{checkpoint_label}_trained.pt"
+        torch.save(
+            {
+                'train_end_date': train_end_date.isoformat(),
+                'train_end_idx': train_end_idx,
+                'final_train_loss': final_loss,
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'arch': {
+                    'n_series': N,
+                    'n_factors': n_factors,
+                    'hidden_size': hidden_size,
+                    'hidden_hidden_size': hidden_hidden_size,
+                    'n_layers': n_layers,
+                    'fe_type': fe_type,
+                    'cde_type': cde_type,
+                    'ode_method': ode_method,
+                },
+            }, ckpt_path)
+ 
+    # Predict on test set.
+    model.eval()
+    records = []
+    with torch.no_grad():
+        for t in range(train_end_idx, T):
+            if np.isnan(gdp_growth[t]):
+                warnings.warn(
+                    f"GDP NaN at t={t} ({nowcast_dates[t].date()}), skipping.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
+ 
+            qtr    = _date_to_quarter_str(nowcast_dates[t])
+            x_snap = _prepend_time_channel(panels[t])[None] # (1, L, N+1)
+            x_t    = torch.tensor(x_snap, dtype=torch.float32, device=device)
+            c_snap = torchcde.natural_cubic_spline_coeffs(x_t)
+            f_snap = torch.tensor(
+                factors[t][None].astype(np.float32),
+                dtype=torch.float32,
+                device=device,
+            )
+            pred_y, _, _ = model(x_t, c_snap, f_snap)
+            y_pred = float(torch.clamp(pred_y, -20.0, 20.0).item())
+            y_true = float(gdp_growth[t])
+ 
+            if verbose:
+                print(
+                    f"[t={t:>3}]  {qtr}  "
+                    f"true={y_true:+.4f}  pred={y_pred:+.4f}  "
+                    f"|err|={abs(y_pred - y_true):.4f}"
+                )
+ 
+            records.append({
+                'nowcast_date': nowcast_dates[t],
+                'y_true': y_true,
+                'y_pred': y_pred,
+            })
+ 
+    predictions = pd.DataFrame(records)
+    history     = pd.DataFrame(history_rows)
+ 
+    return NCDEResult(predictions=predictions, history=history)
+
+
 def load_checkpoint(ckpt_path: str | Path, device: torch.device = None) -> dict:
     """
     Load a saved checkpoint and reconstruct the model.
