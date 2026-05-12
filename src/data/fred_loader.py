@@ -22,7 +22,10 @@ FREDMD_FILENAME = 'fredmd_raw_core.csv'
 FREDQD_FILENAME = 'fredqd_raw.csv'
 
 
-def get_api_key(env_path: str | Path = None):
+def get_api_key(
+    env_path: str | Path = None,
+    for_staff_evaluation: bool =False
+):
     """
     Load the FRED API key from a .env file or the environment.
 
@@ -33,7 +36,11 @@ def get_api_key(env_path: str | Path = None):
         code from the notebooks/ directory)
         4. Environment variable already set in the shell
     """
-    if env_path is not None:
+    if for_staff_evaluation:
+        print("Executing for staff evaluation.\n"
+              "Raw data is already saved locally - no API key needed.")
+        return
+    elif env_path is not None:
         load_dotenv(dotenv_path=Path(env_path))
     else:
         # Try cwd first, then parent directory (handles running code in the 
