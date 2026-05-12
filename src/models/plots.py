@@ -31,10 +31,10 @@ def plot_ncde_training_history(
 
         ax.set(title=f'NCDENow ({label}): mean training loss ± IQR',
                xlabel='Epoch', ylabel='MSE (annualized pp²)')
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=10)
 
     if title is not None:
-        fig.suptitle(title, fontsize=12)
+        fig.suptitle(title, fontsize=14)
     
     return fig, axes
 
@@ -136,6 +136,6 @@ def plot_predictions(
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     ax.xaxis.set_major_locator(mdates.YearLocator(2))
     ax.tick_params(axis='x', rotation=30)
-    ax.legend(loc='lower center', fontsize=8, ncol=3, framealpha=0.9)
+    ax.legend(loc='lower center', fontsize=10, ncol=3, framealpha=0.9)
 
     return fig, ax
