@@ -84,6 +84,11 @@ def build_comparison_table(
     NCDENow (clean)  76   0.xxx   0.xxx   0.xxx     0.xxx       0.xxx
     NCDENow (ragged) 76   0.xxx   0.xxx   0.xxx     0.xxx       0.xxx
     """
+    # Normalize dates across all input dataframes.
+    results_dict = {
+        label: df.assign(nowcast_date=pd.to_datetime(df['nowcast_date']))
+        for label, df in results_dict.items()
+    }
     rows = []
     for label, df in results_dict.items():
         m = compute_metrics(df, label=label)
