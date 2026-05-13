@@ -1,0 +1,11 @@
+fredapi==0.5.2
+matplotlib==3.10.9
+numpy==2.4.4
+pandas==3.0.3
+python-dotenv==1.2.2
+Requests==2.34.0
+scikit_learn==1.8.0
+statsmodels==0.14.6
+torch==2.11.0
+torchcde==0.2.5
+tqdm==4.67.3
